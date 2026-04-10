@@ -6,7 +6,7 @@ This project was completed as part of STAT 3660: Data Visualization and Mining.
 The goal is to analyze gene expression data from the TCGA Lower Grade Glioma (LGG) dataset and build a complete data analysis workflow, including data loading, cleaning, validation, and preprocessing for further analysis and modelling.
 
 ---
-
+```
 ## Project Structure
 
 STAT3660_Project/
@@ -27,7 +27,7 @@ STAT3660_Project/
 ├── output/        
 ├── R/             
 
-
+```
 
 ---
 
