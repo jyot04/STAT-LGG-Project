@@ -16,3 +16,4 @@ Thumbs.db
 *.pdf
 
 StatRmarkdown_files/
+*.Rproj
