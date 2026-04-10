@@ -36,11 +36,21 @@ STAT3660_Project/
 Source: cBioPortal for Cancer Genomics  
 Dataset: Brain Lower Grade Glioma (TCGA, PanCancer Atlas)
 
-## Data
-Dataset too large for GitHub.
+## Data Source
 
-Download from:
-https://www.cbioportal.org/
+The dataset used in this project is from cBioPortal:
+
+Brain Lower Grade Glioma (TCGA, PanCancer Atlas)
+
+To reproduce the analysis:
+
+1. Go to: https://www.cbioportal.org/
+2. Search: "Brain Lower Grade Glioma (TCGA, PanCancer Atlas)"
+3. Download the full dataset (.tar.gz)
+4. Extract it into the `data/` folder
+
+Expected structure:
+data/lgg_tcga_pan_can_atlas_2018/
 
 File used:
 lgg_tcga_pan_can_atlas_2018.tar.gz
