@@ -5,7 +5,11 @@ This project was completed as part of STAT 3660: Data Visualization and Mining.
 
 The goal is to analyze gene expression data from the TCGA Lower Grade Glioma (LGG) dataset and build a complete data analysis workflow, including data loading, cleaning, validation, and preprocessing for further analysis and modelling.
 
----
+## Analytical Question
+
+How does the number of principal components (PCs) used as input features impact the classification performance of a multinomial logistic regression model for LGG tumor subtype prediction, and how does this performance compare to a baseline classifier?
+
+
 ```
 ## Project Structure
 
