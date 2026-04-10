@@ -1,0 +1,18 @@
+# R files to ignore
+.Rhistory
+.RData
+.RDataTmp
+.Rproj.user/
+
+# R Markdown generated files
+*_files/
+
+# System files
+.DS_Store
+Thumbs.db
+
+# Optional: output files (only if you don’t want them on GitHub)
+*.html
+*.pdf
+
+StatRmarkdown_files/

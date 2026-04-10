@@ -1,0 +1,1456 @@
+---
+title: "STAT PROJECT"
+author: "Jyot Patel"
+date: "2026-02-27"
+output:
+  pdf_document: default
+  html_document: default
+---
+
+```{r setup, include=FALSE}
+# Global chunk options
+knitr::opts_chunk$set(echo = TRUE)
+
+
+```
+
+```{r}
+# Verify working directory and data availability
+getwd()
+list.files("data/lgg_tcga_pan_can_atlas_2018")
+```
+
+`############################################################
+
+                    1. Load Clinical Data
+
+`############################################################
+
+```{r task3-load-clinical-patient, message=FALSE, warning=FALSE}
+
+
+#####################  Load Clinical Patient   #####################################
+
+
+
+# Load the data while skipping the first 4 metadata rows
+clinical_patient <- read.delim(
+  "data/lgg_tcga_pan_can_atlas_2018/data_clinical_patient.txt",
+  sep = "\t",
+  header = TRUE,
+  skip = 4,
+  stringsAsFactors = FALSE
+)
+
+# Display the first 10 rows
+head(clinical_patient, 10)
+
+
+```
+
+```{r}
+
+#########################  Load Clinical Sample #################################
+clinical_sample <- read.delim(
+  "data/lgg_tcga_pan_can_atlas_2018/data_clinical_sample.txt",
+  sep = "\t",
+  header = TRUE,
+  skip = 4,
+  stringsAsFactors = FALSE
+)
+
+head(clinical_sample, 10)
+```
+
+```{r}
+
+# connection between the PATIENT_IDs contained in the patient clinical data and the SAMPLE_IDs contained in the sample clinical data
+
+#Each SAMPLE_ID belongs to exactly one PATIENT_ID.
+#But a PATIENT_ID can have:
+#One sample OR multiple samples
+#So the relationship is: One-to-many: one patient → multiple samples
+
+table(clinical_sample$PATIENT_ID)
+
+#If some counts are > 1 → that patient has multiple samples.
+
+length(unique(clinical_patient$PATIENT_ID))
+length(unique(clinical_sample$PATIENT_ID))
+
+```
+
+`############################################################
+
+                2. Load mRNA Expression Data
+
+`############################################################
+
+```{r}
+
+############################## Load mRNA #########################################
+
+mrna_data <- read.delim(
+  "data/lgg_tcga_pan_can_atlas_2018/data_mrna_seq_v2_rsem.txt",
+  sep = "\t",
+  header = TRUE,
+  #nrows = 250,              # ← only first 250 genes
+  stringsAsFactors = FALSE,
+  check.names = FALSE
+)
+
+head(mrna_data, 10)
+
+dim(mrna_data)
+
+num_genes <- nrow(mrna_data)
+num_samples <- ncol(mrna_data) - 1
+
+mrna_raw <- mrna_data
+
+```
+
+`############################################################
+
+                     3. Data Cleaning
+
+`############################################################
+
+```{r}
+# --1) Drop irrelevant variables (metadata / redundant IDs)
+# Entrez_Gene_Id is redundant for modeling here (gene name is enough).
+mrna_clean <- mrna_raw
+
+# Check if Entrez_Gene_Id exists
+has_entrez <- "Entrez_Gene_Id" %in% colnames(mrna_raw)
+
+if (has_entrez) {
+  mrna_clean$Entrez_Gene_Id <- NULL
+  cat("\n[CLEAN] Dropped Entrez_Gene_Id (redundant gene identifier).\n")
+} else {
+  cat("\n[NOTE] Entrez_Gene_Id not present — nothing to drop.\n")
+}
+
+cat("[CLEAN] Dimensions after dropping irrelevant columns:", 
+    nrow(mrna_clean), ncol(mrna_clean), "\n")
+```
+
+```{r}
+
+##### How many missing rows in Hugo_symbol ###########
+
+sum(is.na(mrna_raw$Hugo_Symbol) | mrna_raw$Hugo_Symbol == "")
+
+```
+
+```{r}
+
+# --- Drop genes with missing Hugo_Symbol (standardized gene name)
+# Count missing Hugo_Symbol
+missing_hugo <- sum(is.na(mrna_clean$Hugo_Symbol) | mrna_clean$Hugo_Symbol == "")
+cat("\n[CHECK] Missing Hugo_Symbol rows:", missing_hugo, "\n")
+
+# Remove those rows
+before <- nrow(mrna_clean)
+mrna_clean <- mrna_clean[!(is.na(mrna_clean$Hugo_Symbol) | mrna_clean$Hugo_Symbol == ""), ]
+after <- nrow(mrna_clean)
+
+cat("[CLEAN] Dropped rows with missing Hugo_Symbol.\n")
+cat("        Rows before:", before, "Rows after:", after, "Removed:", before - after, "\n")
+
+```
+
+```{r}
+
+# --2) Check data types
+# Hugo_Symbol should be character; all sample columns should be numeric.
+cat("\n[CHECK] Column classes (first 5 columns after cleaning):\n\n")
+print(sapply(mrna_clean[, 1:min(5, ncol(mrna_clean))], class))
+
+# Identify sample columns = everything except Hugo_Symbol
+sample_cols <- setdiff(colnames(mrna_clean), "Hugo_Symbol")
+
+# Check how many sample columns are numeric
+is_num <- sapply(mrna_clean[, sample_cols, drop=FALSE], is.numeric)
+cat("\n[CHECK] Numeric sample columns:", sum(is_num), "out of", length(sample_cols), "\n")
+
+# If any sample columns are not numeric, coerce them safely
+if (any(!is_num)) {
+  bad_cols <- names(is_num)[!is_num]
+  cat("[CLEAN] Non-numeric sample columns detected:", length(bad_cols), "\n")
+  cat("        Coercing them to numeric (may introduce NAs if parsing fails).\n")
+  
+  for (cc in bad_cols) {
+    mrna_clean[[cc]] <- suppressWarnings(as.numeric(mrna_clean[[cc]]))
+  }
+  
+  # Re-check after coercion
+  is_num2 <- sapply(mrna_clean[, sample_cols, drop=FALSE], is.numeric)
+  cat("[CLEAN] Numeric sample columns after coercion:", sum(is_num2), "out of", length(sample_cols), "\n")
+}
+```
+
+```{r}
+
+# --3) Check data domains (are expression values valid?)
+# For RSEM normalized expected read counts: values should be >= 0 (non-negative).
+mat <- as.matrix(mrna_clean[, sample_cols, drop=FALSE])
+
+min_val <- suppressWarnings(min(mat, na.rm = TRUE))
+max_val <- suppressWarnings(max(mat, na.rm = TRUE))
+
+cat("\n[CHECK] Expression domain:\n")
+cat("  - Min value:", min_val, "\n")
+cat("  - Max value:", max_val, "\n")
+
+# Count negatives
+neg_count <- sum(mat < 0, na.rm = TRUE)
+cat("  - Negative values count:", neg_count, "\n")
+
+# If negatives exist, you must decide what to do (usually they shouldn't exist)
+# Here we DO NOT auto-fix them; we flag them loudly.
+if (neg_count > 0) {
+  cat("[WARNING] Negative expression values found. This is unexpected for RSEM counts.\n")
+  cat("          You should investigate (file version, transformation, parsing).\n")
+}
+
+```
+
+```{r}
+
+# --4) Check missing data (NAs)
+na_total <- sum(is.na(mrna_clean))
+na_by_col <- sort(colSums(is.na(mrna_clean)), decreasing = TRUE)
+
+cat("\n[CHECK] Missing data (NAs):\n")
+cat("  - Total NA values in dataset:", na_total, "\n")
+cat("  - Columns with NAs (top 10):\n")
+print(head(na_by_col[na_by_col > 0], 10))
+
+# If NAs exist, a common choice is to drop genes with ANY NA across samples
+# Justification: gene expression should be complete; NAs complicate modeling.
+if (na_total > 0) {
+  before <- nrow(mrna_clean)
+  mrna_clean <- mrna_clean[complete.cases(mrna_clean), ]
+  after <- nrow(mrna_clean)
+  cat("[CLEAN] Dropped rows (genes) with any NA.\n")
+  cat("        Rows before:", before, "Rows after:", after, "Rows removed:", before - after, "\n")
+  
+  # Recompute sample matrix after filtering
+  sample_cols <- setdiff(colnames(mrna_clean), "Hugo_Symbol")
+  mat <- as.matrix(mrna_clean[, sample_cols, drop=FALSE])
+  cat("        Total NAs after removal:", sum(is.na(mrna_clean)), "\n")
+} else {
+  cat("[CLEAN] No NAs found. No rows removed for missingness.\n")
+}
+
+```
+
+```{r}
+
+# --5) Check for duplicate genes (duplicate Hugo_Symbol)
+dup_gene_count <- sum(duplicated(mrna_clean$Hugo_Symbol))
+cat("\n[CHECK] Duplicate Hugo_Symbol count:", dup_gene_count, "\n")
+
+# If duplicates exist, keep the first occurrence (simple, transparent rule).
+# Alternative: average duplicates, keep max variance, etc. But keep-first is acceptable if justified.
+if (dup_gene_count > 0) {
+  before <- nrow(mrna_clean)
+  mrna_clean <- mrna_clean[!duplicated(mrna_clean$Hugo_Symbol), ]
+  after <- nrow(mrna_clean)
+  cat("[CLEAN] Removed duplicate genes by keeping the first occurrence.\n")
+  cat("        Rows before:", before, "Rows after:", after, "Removed:", before - after, "\n")
+}
+
+```
+
+```{r}
+
+# --6) Check for duplicate sample columns (duplicate SAMPLE IDs)
+# In wide format, duplicated column names mean duplicated samples.
+dup_sample_cols <- sum(duplicated(sample_cols))
+cat("\n[CHECK] Duplicate sample columns (by column name):", dup_sample_cols, "\n")
+
+# If duplicates exist, keep the first (again, simple rule).
+if (dup_sample_cols > 0) {
+  keep_cols <- !duplicated(colnames(mrna_clean))
+  mrna_clean <- mrna_clean[, keep_cols]
+  cat("[CLEAN] Removed duplicated sample columns by keeping first occurrence.\n")
+  cat("        New dimensions:", nrow(mrna_clean), ncol(mrna_clean), "\n")
+  sample_cols <- setdiff(colnames(mrna_clean), "Hugo_Symbol")
+  mat <- as.matrix(mrna_clean[, sample_cols, drop=FALSE])
+}
+
+```
+
+```{r}
+
+# --- 8) Executive summary (print final stats)
+cat("\n=========================\n")
+cat("EXECUTIVE SUMMARY (mRNA CLEANING)\n")
+cat("=========================\n")
+cat("Final dimensions (rows=genes, cols=1 + samples):", nrow(mrna_clean), ncol(mrna_clean), "\n")
+cat("Final genes:", nrow(mrna_clean), "\n")
+cat("Final samples:", ncol(mrna_clean) - 1, "\n")
+cat("Total NAs now:", sum(is.na(mrna_clean)), "\n")
+cat("Duplicate genes now:", sum(duplicated(mrna_clean$Hugo_Symbol)), "\n")
+cat("Min/Max expression now:", min(as.matrix(mrna_clean[, -1]), na.rm=TRUE), "/", 
+                               max(as.matrix(mrna_clean[, -1]), na.rm=TRUE), "\n")
+
+#  9) Display first 10 rows (as required)
+cat("\n[OUTPUT] First 10 rows of cleaned mRNA data:\n")
+head(mrna_clean, 10)
+
+```
+
+```{r}
+
+# =========================
+# Assignment 2 - Part B
+# Quality check + clean patient clinical data
+# =========================
+
+# Keep only required columns
+clinical_patient_clean <- clinical_patient[, c("PATIENT_ID", "SUBTYPE")]
+
+cat("\n[CLEAN] Dimensions after keeping PATIENT_ID and SUBTYPE:",
+    nrow(clinical_patient_clean), ncol(clinical_patient_clean), "\n")
+
+# Check data types
+cat("\n[CHECK] Column classes:\n")
+print(sapply(clinical_patient_clean, class))
+
+# Check missing values
+total_na <- sum(is.na(clinical_patient_clean))
+cat("\n[CHECK] Total NA values:", total_na, "\n")
+
+na_by_col <- colSums(is.na(clinical_patient_clean))
+cat("[CHECK] NA per column:\n")
+print(na_by_col)
+
+# Remove rows with missing or empty SUBTYPE
+before <- nrow(clinical_patient_clean)
+
+clinical_patient_clean <- clinical_patient_clean[
+  !is.na(clinical_patient_clean$SUBTYPE) &
+  clinical_patient_clean$SUBTYPE != "",
+]
+
+after <- nrow(clinical_patient_clean)
+
+cat("\n[CLEAN] Removed rows with missing SUBTYPE.\n")
+cat("Rows before:", before,
+    "Rows after:", after,
+    "Removed:", before - after, "\n")
+
+# Check duplicate PATIENT_ID
+dup_count <- sum(duplicated(clinical_patient_clean$PATIENT_ID))
+cat("\n[CHECK] Duplicate PATIENT_ID count:", dup_count, "\n")
+
+if (dup_count > 0) {
+  clinical_patient_clean <- clinical_patient_clean[
+    !duplicated(clinical_patient_clean$PATIENT_ID),
+  ]
+  cat("[CLEAN] Duplicate PATIENT_ID rows removed.\n")
+} else {
+  cat("[CLEAN] No duplicate PATIENT_ID found.\n")
+}
+
+# Executive summary
+cat("\n=========================\n")
+cat("EXECUTIVE SUMMARY (PATIENT DATA)\n")
+cat("=========================\n")
+cat("Final number of patients:", nrow(clinical_patient_clean), "\n")
+cat("Total NA values:", sum(is.na(clinical_patient_clean)), "\n")
+cat("Duplicate PATIENT_ID:", sum(duplicated(clinical_patient_clean$PATIENT_ID)), "\n")
+
+# Display first 10 rows (required in assignment)
+head(clinical_patient_clean, 10)
+
+```
+
+```{r}
+# =========================
+# Assignment 2 - Part c
+# Quality check + clean  clinical Sample data
+# =========================
+
+# Keep only PATIENT_ID and SAMPLE_ID
+clinical_sample_clean <- clinical_sample[, c("PATIENT_ID", "SAMPLE_ID")]
+
+cat("\n[CLEAN] Dimensions after keeping PATIENT_ID and SAMPLE_ID:",
+    nrow(clinical_sample_clean), ncol(clinical_sample_clean), "\n")
+
+# Check data types
+cat("\n[CHECK] Column classes:\n")
+print(sapply(clinical_sample_clean, class))
+
+# Check missing values
+total_na <- sum(is.na(clinical_sample_clean))
+cat("\n[CHECK] Total NA values:", total_na, "\n")
+
+na_by_col <- colSums(is.na(clinical_sample_clean))
+cat("[CHECK] NA per column:\n")
+print(na_by_col)
+
+# Remove rows with missing PATIENT_ID or SAMPLE_ID
+before <- nrow(clinical_sample_clean)
+
+clinical_sample_clean <- clinical_sample_clean[
+  !is.na(clinical_sample_clean$PATIENT_ID) &
+  clinical_sample_clean$PATIENT_ID != "" &
+  !is.na(clinical_sample_clean$SAMPLE_ID) &
+  clinical_sample_clean$SAMPLE_ID != "",
+]
+
+after <- nrow(clinical_sample_clean)
+
+cat("\n[CLEAN] Removed rows with missing IDs.\n")
+cat("Rows before:", before,
+    "Rows after:", after,
+    "Removed:", before - after, "\n")
+
+# Check duplicate SAMPLE_ID (should be unique)
+dup_sample <- sum(duplicated(clinical_sample_clean$SAMPLE_ID))
+cat("\n[CHECK] Duplicate SAMPLE_ID count:", dup_sample, "\n")
+
+if (dup_sample > 0) {
+  clinical_sample_clean <- clinical_sample_clean[
+    !duplicated(clinical_sample_clean$SAMPLE_ID),
+  ]
+  cat("[CLEAN] Duplicate SAMPLE_ID rows removed.\n")
+} else {
+  cat("[CLEAN] No duplicate SAMPLE_ID found.\n")
+}
+
+# Check duplicate PATIENT_ID (can exist — one patient may have multiple samples)
+dup_patient <- sum(duplicated(clinical_sample_clean$PATIENT_ID))
+cat("[CHECK] Duplicate PATIENT_ID count:", dup_patient, "\n")
+
+# Executive summary
+cat("\n=========================\n")
+cat("EXECUTIVE SUMMARY (SAMPLE DATA)\n")
+cat("=========================\n")
+cat("Final number of samples:", nrow(clinical_sample_clean), "\n")
+cat("Total NA values:", sum(is.na(clinical_sample_clean)), "\n")
+cat("Duplicate SAMPLE_ID:", sum(duplicated(clinical_sample_clean$SAMPLE_ID)), "\n")
+
+# Display first 10 rows (required)
+head(clinical_sample_clean, 10)
+```
+
+The clinical patient dataset contained 514 entries, of which 7 were removed due to missing subtype information, resulting in 507 labeled patients. The clinical sample dataset contained 514 samples with no missing identifiers. The difference in counts reflects samples belonging to patients without subtype labels. After merging the datasets on PATIENT_ID, the resulting dataset contains 507 samples with valid subtype classification.
+
+```{r}
+
+#####################  Part D Step 1: Transpose mRNA  #########################
+
+# Extract gene names
+gene_names <- mrna_clean$Hugo_Symbol
+
+# Extract numeric matrix
+mrna_matrix <- as.matrix(mrna_clean[, -1])
+
+# Transpose (samples become rows)
+mrna_transposed <- t(mrna_matrix)
+
+# Convert to data frame
+mrna_transposed <- as.data.frame(mrna_transposed)
+
+# Assign gene names as column names
+colnames(mrna_transposed) <- gene_names
+
+# Add SAMPLE_ID column
+mrna_transposed$SAMPLE_ID <- rownames(mrna_transposed)
+
+# Move SAMPLE_ID to first column
+mrna_transposed <- mrna_transposed[, c("SAMPLE_ID", gene_names)]
+
+# Reset rownames
+rownames(mrna_transposed) <- NULL
+
+cat("[CHECK] Dimensions after transpose:",
+    nrow(mrna_transposed), ncol(mrna_transposed), "\n")
+```
+
+```{r}
+#####################  Part D Step 2: Merge Sample + Patient #####################
+
+sample_patient_df <- merge(
+  clinical_sample_clean,
+  clinical_patient_clean,
+  by = "PATIENT_ID"
+)
+
+cat("[CHECK] Dimensions after merging sample + patient:",
+    nrow(sample_patient_df), ncol(sample_patient_df), "\n")
+```
+
+```{r}
+#####################  Part D Step 3: Merge with mRNA #####################################
+
+final_df <- merge(
+  sample_patient_df[, c("SAMPLE_ID", "SUBTYPE")],
+  mrna_transposed,
+  by = "SAMPLE_ID"
+)
+
+cat("[CHECK] Final dimensions:",
+    nrow(final_df), ncol(final_df), "\n")
+```
+
+```{r}
+head(final_df, 10)
+```
+
+```{r}
+#####################  Final Step: Remove Zero-Variance Genes ######################
+
+# Identify gene columns (exclude SAMPLE_ID and SUBTYPE)
+gene_cols <- setdiff(colnames(final_df), c("SAMPLE_ID", "SUBTYPE"))
+
+# Compute variance for each gene across samples
+gene_var_final <- sapply(final_df[, gene_cols, drop = FALSE], var, na.rm = TRUE)
+
+# Count zero-variance genes
+zero_var_count_final <- sum(gene_var_final == 0, na.rm = TRUE)
+
+cat("\n[CHECK] Zero-variance genes in final dataset:", zero_var_count_final, "\n")
+
+# Remove zero-variance genes
+if (zero_var_count_final > 0) {
+  before_cols <- ncol(final_df)
+  
+  final_df <- final_df[, c("SAMPLE_ID", "SUBTYPE",
+                           names(gene_var_final[gene_var_final != 0]))]
+  
+  after_cols <- ncol(final_df)
+  
+  cat("[CLEAN] Removed zero-variance genes.\n")
+  cat("Columns before:", before_cols,
+      "Columns after:", after_cols,
+      "Removed:", before_cols - after_cols, "\n")
+} else {
+  cat("[CLEAN] No zero-variance genes found in final dataset.\n")
+}
+```
+
+```{r}
+write.csv(final_df,
+          "data/LGG_cleaned_expression_dataset.csv",
+          row.names = FALSE)
+```
+
+
+
+
+```{r}
+# Task 1: Read the cancer subtype annotated mRNA expression dataset
+
+lgg_data <- read.csv("data/LGG_cleaned_expression_dataset.csv")
+
+# Display the first 10 rows
+head(lgg_data, 10)
+```
+
+
+```{r} 
+#Task 2: 
+
+# Load cleaned dataset
+
+lgg_data <- read.csv("data/LGG_cleaned_expression_dataset.csv")
+```
+
+
+
+```{r} 
+#Create a summary table
+
+#This table shows ERBB2 statistics for each subtype. 
+
+library(dplyr)
+
+erbb2_summary <- lgg_data %>%
+  group_by(SUBTYPE) %>%
+  summarise(
+    Mean_ERBB2 = mean(ERBB2, na.rm = TRUE),
+    Median_ERBB2 = median(ERBB2, na.rm = TRUE),
+    SD_ERBB2 = sd(ERBB2, na.rm = TRUE),
+    Samples = n()
+  )
+
+erbb2_summary
+```
+
+
+
+
+```{r}
+install.packages("ggplot2")
+```
+
+
+```{r} 
+#ggplot2 
+
+library(ggplot2)
+
+ggplot(lgg_data, aes(x = SUBTYPE, y = ERBB2, fill = SUBTYPE)) +
+  geom_boxplot() +
+  labs(
+    title = "Distribution of ERBB2 Expression by LGG Subtype",
+    x = "LGG Tumor Subtype",
+    y = "ERBB2 Expression"
+  ) +
+  theme_minimal()
+```
+What the plot shows ,From your visualization:
+
+ 1 LGG_IDHwt
+
+Much higher ERBB2 expression
+Very large spread 
+Several extreme values
+
+ 2 LGG_IDHmut-codel
+
+Lower expression
+Smaller spread
+
+ 3 LGG_IDHmut-non-codel
+
+Similar to IDHmut-codel
+Also relatively tight distribution
+
+The boxplot shows that ERBB2 expression varies across LGG tumor subtypes. In particular, the LGG_IDHwt subtype tends to have higher ERBB2 expression and greater variability compared to the LGG_IDHmut-codel and LGG_IDHmut-non-codel subtypes. However, there is still substantial overlap between the expression ranges of the three subtypes, especially between the two IDHmut groups. This overlap suggests that ERBB2 expression alone may not clearly distinguish between tumor subtypes.
+
+```{r} 
+#### Task 4 #########
+# Step 1 — Apply log₂(x + 1) transformation
+
+erbb2_log <- log2(lgg_data$ERBB2 + 1)
+
+# Step 2 — Create histogram
+
+hist(erbb2_log,
+     col = "skyblue",
+     main = "Histogram of log2(x + 1) Transformed ERBB2 Expression",
+     xlab = "log2(ERBB2 + 1)",
+     breaks = 30)
+ 
+```
+
+The histogram of the log₂(x + 1) transformed ERBB2 expression values shows a more symmetric distribution compared to the raw expression values. The transformation compresses large values and reduces the impact of extreme outliers, which helps reduce skewness in the data. This makes the gene expression values more suitable for statistical analysis and downstream methods such as standardization and PCA.
+
+
+```{r} 
+ ###### Task 5 #####
+
+# Step 1 — Apply log₂(x + 1) to gene columns
+
+# Apply log2(x + 1) transformation to gene expression columns
+lgg_log <- lgg_data
+
+lgg_log[, 3:ncol(lgg_log)] <- log2(lgg_log[, 3:ncol(lgg_log)] + 1)
+
+# Step 2 — Print first 10 rows
+
+head(lgg_log, 10)
+
+
+```
+
+The log₂(x + 1) transformation was applied to all gene expression values to reduce skewness and compress large expression values. Gene expression datasets often contain highly variable values and extreme outliers, which can negatively affect statistical analyses. Applying the log transformation stabilizes the variance and makes the distribution of gene expression values more symmetric, improving the suitability of the data for downstream analyses such as standardization and PCA.
+
+```{r} 
+# check any zero variance still there or not
+
+ sum(apply(lgg_log[,3:ncol(lgg_log)], 2, var) == 0)
+```
+Task 6 is about standardizing the log-transformed gene expression values before PCA.
+Why we standardize
+After log transformation, genes still have different scales and variances. Some genes may have larger ranges than others. If we run PCA directly, genes with larger variance dominate the principal components.
+
+Standardization solves this by transforming each gene so that:
+
+          𝑥- mean
+  z =     _________
+    
+            sd
+
+
+
+This makes every gene have:
+mean = 0
+standard deviation = 1
+
+This ensures all genes contribute equally to PCA and distance calculations, which is important for high-dimensional genomic data.
+
+```{r} 
+# Task 6 is about standardizing the log-transformed gene expression values before PCA.
+
+# Copy the log-transformed dataset
+lgg_scaled <- lgg_log
+
+# Standardize gene expression values
+lgg_scaled[,3:ncol(lgg_scaled)] <- scale(lgg_log[,3:ncol(lgg_log)])
+
+# Display first 10 rows
+head(lgg_scaled, 10)
+
+```
+ This means:
+ negative values → below average expression
+ positive values → above average expression
+
+The log-transformed gene expression values were standardized using z-score normalization so that each gene has mean 0 and standard deviation 1 across samples. This step ensures that genes with larger expression ranges do not dominate the analysis. Standardization is particularly important before applying PCA.
+
+
+`     ################ PCA ####################
+
+```{r} 
+# Task 7 is where real dimensionality reduction begins.PCA will work poorly if we keep all genes because many genes have very little variation across samples. Those genes contain almost no useful information for distinguishing tumor subtypes.
+
+# So the idea is to keep only genes with higher variance.
+```
+
+```{r}
+#####################  Histogram with Percentile Lines #####################################
+
+# Compute variance
+gene_cols <- setdiff(colnames(final_df), c("SAMPLE_ID", "SUBTYPE"))
+gene_var <- apply(final_df[, gene_cols], 2, var)
+
+# Log scale
+log_var <- log10(gene_var + 1)
+
+# Plot histogram
+hist(log_var,
+     breaks = 100,
+     col = "lightblue",
+     border = "white",
+     main = "Log-Scaled Gene Variance Distribution",
+     xlab = "log10(Variance + 1)")
+
+# Percentiles (10% to 90%)
+percentiles <- quantile(log_var, probs = seq(0.1, 0.9, 0.1))
+
+# Add vertical dotted lines
+abline(v = percentiles,
+       col = "red",
+       lty = 2,     # dotted
+       lwd = 1.5)
+
+# Optional: label them
+text(x = percentiles,
+     y = par("usr")[4] * 0.9,
+     labels = paste0(seq(10,90,10), "%"),
+     col = "red",
+     srt = 90,
+     cex = 0.7,
+     pos = 4)
+```
+
+A log10(variance + 1) transformation was applied to the gene variance values to reduce skewness and improve visualization
+log10(variance + 1) = compressed measure of how much a gene varies
+
+
+Based on the variance distribution, the bottom 30% of genes were removed using a percentile-based threshold. This corresponds approximately to a log10(variance + 1) value of 3.3, which translates to a variance of about 2000 on the original scale.
+
+```{r}
+#####################  Task 7: Variance Filtering #####################################
+
+gene_cols <- setdiff(colnames(final_df), c("SAMPLE_ID", "SUBTYPE"))
+
+gene_var <- apply(final_df[, gene_cols], 2, var)
+
+# Remove bottom 30% low-variance genes
+threshold <- quantile(gene_var, 0.30)
+
+selected_genes <- names(gene_var[gene_var > threshold])
+
+final_filtered <- final_df[, c("SAMPLE_ID", "SUBTYPE", selected_genes)]
+
+cat("Genes before:", length(gene_var), "\n")
+cat("Genes after:", length(selected_genes), "\n")
+cat("Genes removed:", length(gene_var) - length(selected_genes), "\n")
+
+head(final_filtered, 10)
+
+```
+
+
+
+```{r}
+#####################  Standardize Filtered Data #####################################
+
+# Copy filtered dataset
+final_filtered_scaled <- final_filtered
+
+# Identify gene columns (exclude metadata)
+gene_cols <- setdiff(colnames(final_filtered), c("SAMPLE_ID", "SUBTYPE"))
+
+# Apply z-score standardization
+final_filtered_scaled[, gene_cols] <- scale(final_filtered[, gene_cols])
+
+# Show first 10 rows
+head(final_filtered_scaled, 10)
+
+```
+
+```{r}
+#####################  Task 8: Write to CSV #####################################
+
+write.csv(final_filtered_scaled,
+          file = "data/LGG_preprocessed_data.csv",
+          row.names = FALSE)
+
+```
+
+
+
+
+```{r}
+#####################  Task 9: Train-Test Split #####################################
+
+# Set seed 
+set.seed(355434)  
+
+# Total number of samples
+n <- nrow(final_filtered_scaled)
+
+# Create random indices for training (80%)
+train_index <- sample(1:n, size = 0.8 * n)
+
+# Split the data
+train_data <- final_filtered_scaled[train_index, ]
+test_data  <- final_filtered_scaled[-train_index, ]
+
+# Check sizes
+cat("Training samples:", nrow(train_data), "\n")
+cat("Testing samples:", nrow(test_data), "\n")
+
+```
+
+
+
+```{r}
+#####################  Task 10: PCA on Training Data #####################################
+
+# Extract only gene expression columns for PCA
+train_x <- train_data[, -(1:2)]   # removes SAMPLE_ID and SUBTYPE
+
+# Run PCA on training data
+pca_train <- prcomp(train_x, center = FALSE, scale. = FALSE)
+
+# Create a plotting data frame using first two PCs
+pca_train_df <- data.frame(
+  PC1 = pca_train$x[, 1],
+  PC2 = pca_train$x[, 2],
+  SUBTYPE = train_data$SUBTYPE
+)
+
+# Plot PC1 vs PC2 colored by subtype
+subtype_colors <- c("red", "blue", "green")
+plot(pca_train_df$PC1, pca_train_df$PC2,
+     col = subtype_colors[as.factor(pca_train_df$SUBTYPE)],
+     pch = 19,
+     xlab = "PC1",
+     ylab = "PC2",
+     main = "PCA of Training Data (PC1 vs PC2)")
+
+legend("topright",
+       legend = levels(as.factor(pca_train_df$SUBTYPE)),
+       col = subtype_colors,
+       pch = 19,
+       cex = 0.8)
+```
+
+
+
+```{r}
+#Task 11: Construct a scree plot of the first 25 principal components
+pca_train
+
+
+
+#####################  Task 11: Scree Plot #####################################
+
+# Variance explained
+var_explained <- (pca_train$sdev)^2
+
+# Proportion of variance
+prop_var <- var_explained / sum(var_explained)
+
+# First 25 PCs
+prop_var_25 <- prop_var[1:25]
+
+# Scree plot
+plot(prop_var_25,
+     type = "b",
+     pch = 19,
+     xlab = "Principal Component",
+     ylab = "Proportion of Variance Explained",
+     main = "Scree Plot (First 25 PCs)")
+
+
+
+# Cumulative variance
+cum_var_25 <- cumsum(prop_var_25)
+
+plot(cum_var_25,
+     type = "b",
+     pch = 19,
+     xlab = "Principal Component",
+     ylab = "Cumulative Variance Explained",
+     main = "Cumulative Variance (First 25 PCs)")
+```
+
+The cumulative variance plot shows that the first few principal components capture a substantial portion of the variability, with diminishing returns as more components are added. Approximately 20 principal components explain around 65% of the total variance. The curve begins to flatten after around 10–15 components, suggesting that additional components contribute relatively less information. Therefore, retaining approximately 15–20 principal components provides a reasonable balance between dimensionality reduction and information retention.
+
+
+The gradual increase in cumulative variance and lack of a sharp elbow further indicate that the data does not lie in a low-dimensional space.
+
+```{r}
+#####################  Task 13: Extract Reduced Data #####################################
+
+# Number of PCs to keep
+k <- 20
+
+# Extract first k PCs
+train_pca_reduced <- data.frame(pca_train$x[, 1:k])
+
+# Add labels back
+train_pca_reduced$SUBTYPE <- train_data$SUBTYPE
+train_pca_reduced$SAMPLE_ID <- train_data$SAMPLE_ID
+
+# Reorder columns
+train_pca_reduced <- train_pca_reduced[, c("SAMPLE_ID", "SUBTYPE", paste0("PC", 1:k))]
+```
+
+
+```{r}
+#####################  Save CSV #####################################
+
+write.csv(train_pca_reduced,
+          file = "data/LGG_PCA_reduced_data.csv",
+          row.names = FALSE)
+```
+A principal component (PC) is a combination of original variables that captures the most important patterns in the data.
+
+🔥 What each PC is doing
+👉 PC1
+captures maximum variation in data
+most important pattern
+👉 PC2
+second most important pattern
+👉 PC3, PC4...
+less and less important
+
+PCA solves this:
+Problem	                                   PCA solution
+-------                                    ------------
+too many variables        --->            reduces to few PCs
+correlated genes          --->            combines them
+noisy data	              --->            keeps main signal
+
+
+
+```{r}
+#✅ Task 1 — Read dataset + show first 10 rows
+
+# Load required library
+library(readr)
+
+# Read the preprocessed dataset (before PCA)
+lgg_data <- read_csv("data/LGG_preprocessed_data.csv")
+
+# Convert subtype to factor
+lgg_data$SUBTYPE <- as.factor(lgg_data$SUBTYPE)
+
+# Show first 10 rows
+head(lgg_data, 10)
+```
+
+
+```{r}
+#✅ Task 2 — Train/Test split
+library(readr)
+
+# Read correct dataset
+lgg_data <- read_csv("data/LGG_preprocessed_data.csv")
+
+# Convert subtype
+lgg_data$SUBTYPE <- as.factor(lgg_data$SUBTYPE)
+
+# Set seed 
+set.seed(355434)  
+
+# 80/20 split
+train_index <- sample(1:nrow(lgg_data), 0.8 * nrow(lgg_data))
+
+train_data <- lgg_data[train_index, ]
+test_data  <- lgg_data[-train_index, ]
+```
+
+
+
+```{r}
+#✅ Task 3 — PCA on training data
+# Remove ID and subtype
+train_x <- train_data[, !(names(train_data) %in% c("SAMPLE_ID", "SUBTYPE"))]
+
+# Apply PCA
+pca_model <- prcomp(train_x, scale. = TRUE)
+
+# Get PCA scores
+train_pca <- as.data.frame(pca_model$x)
+
+# Add subtype back
+train_pca$SUBTYPE <- train_data$SUBTYPE
+
+# Show first 10 rows
+head(train_pca, 10)
+```
+
+
+
+
+```{r}
+#✅ aTsk 4 — Apply  PCA to test data
+# Prepare test predictors
+test_x <- test_data[, !(names(test_data) %in% c("SAMPLE_ID", "SUBTYPE"))]
+
+# Apply SAME PCA transformation
+test_pca <- predict(pca_model, newdata = test_x)
+
+test_pca <- as.data.frame(test_pca)
+test_pca$SUBTYPE <- test_data$SUBTYPE
+
+# Show first 10 rows
+head(test_pca, 10)
+
+```
+
+
+
+
+
+```{r}
+#Task-6
+install.packages("ggplot2")
+library(ggplot2)
+library(dplyr)
+library(scales)
+train_counts <- as.data.frame(table(train_data$SUBTYPE))
+colnames(train_counts) <- c("SUBTYPE", "Count")
+train_counts$Dataset <- "Training"
+
+test_counts <- as.data.frame(table(test_data$SUBTYPE))
+colnames(test_counts) <- c("SUBTYPE", "Count")
+test_counts$Dataset <- "Test"
+
+combined_counts <- bind_rows(train_counts, test_counts) %>%
+  group_by(Dataset) %>%
+  mutate(Percent = Count / sum(Count),
+         Label = paste0(Count, "\n(", percent(Percent, accuracy = 0.1), ")"))
+
+ggplot(combined_counts, aes(x = SUBTYPE, y = Count, fill = Dataset)) +
+  geom_col(position = position_dodge(width = 0.75), width = 0.65) +
+  geom_text(aes(label = Label),
+            position = position_dodge(width = 0.75),
+            vjust = -0.35,
+            size = 3.7,
+            lineheight = 0.95) +
+  labs(
+    title = "LGG Molecular Subtype Distribution",
+    subtitle = "Comparison of training and test datasets",
+    x = "Tumor Subtype",
+    y = "Number of Samples"
+  ) +
+  scale_x_discrete(labels = function(x) stringr::str_wrap(x, width = 2)) +
+  scale_y_continuous(expand = expansion(mult = c(0, 0.2)))
+
+```
+
+👉  data is unbalanced 
+
+IDHmut-non-codel → largest
+IDHmut-codel → medium
+IDHwt → smallest
+
+If ignore this, model will:
+👉 favor the majority class
+👉 give misleading accuracy
+
+
+
+```{r}
+#task -7
+library(nnet)
+
+# Keep only first 20 principal components + response
+train_pca_20 <- train_pca[, c("SUBTYPE", paste0("PC", 1:20))]
+test_pca_20  <- test_pca[,  c("SUBTYPE", paste0("PC", 1:20))]
+
+# Make sure response is factor
+train_pca_20$SUBTYPE <- as.factor(train_pca_20$SUBTYPE)
+test_pca_20$SUBTYPE  <- as.factor(test_pca_20$SUBTYPE)
+
+# Compute inverse-frequency class weights
+class_counts <- table(train_pca_20$SUBTYPE)
+class_weights <- 1 / class_counts
+obs_weights <- as.numeric(class_weights[as.character(train_pca_20$SUBTYPE)])
+
+# Fit weighted multinomial logistic regression
+multi_model <- multinom(SUBTYPE ~ ., data = train_pca_20, weights = obs_weights, trace = FALSE)
+```
+
+The LGG subtype distribution is imbalanced, with some classes having significantly more samples than others. To address this, inverse-frequency class weights were incorporated into a multinomial logistic regression model so that minority classes receive greater importance during training. Additionally, only the first 20 principal components were used to reduce model complexity and prevent overparameterization.
+
+Making sure minority subtypes are not ignored
+----------------------------------------------------------------
+⚙️ What is the model doing internally?
+
+👉 It learns patterns like:
+
+“If PC1 high + PC2 low → likely subtype A”
+“If PC3 very negative → subtype B”
+
+Basically:
+👉 It finds relationships between PCs and subtype
+------------------------------------------------------------------
+
+🔥 Why we use this model (simple answer)
+
+We use multinomial logistic regression because:
+
+1)We need to predict multiple categories (3 subtypes)
+2)It works well with numeric inputs (PCs)
+3)It is simple, interpretable, and a good baseline
+--------------------------------------------------------------------
+
+“One in Ten Rule” means
+for classification, people often phrase it as:
+
+You want about 10 cases per predictor, and for categorical outcomes it is safer to think about the smallest class being the limiting factor.
+
+Apply it to your data
+
+From your subtype counts in the training data:
+
+LGG_IDHmut-codel = 143
+LGG_IDHmut-non-codel = 192
+LGG_IDHwt = 70
+
+The smallest training class is 70.
+
+Using the One in Ten Rule, a reasonable upper bound is:
+
+70 / 10 = 7
+So a safe recommendation is to use about 7 principal components.
+
+Why not 20 PCs?
+
+Because Task 7 already exposed the problem: when you tried to fit the multinomial model with too many predictors, the model became too complex. That is exactly the kind of issue the One in Ten Rule is trying to prevent.
+
+Therefore, an appropriate choice is to use the first 7 principal components in the multinomial logistic regression model.
+
+```{r}
+
+#with first 7 PCs
+library(nnet)
+
+# Keep only first 7 principal components + response
+train_pca_7 <- train_pca[, c("SUBTYPE", paste0("PC", 1:7))]
+test_pca_7  <- test_pca[,  c("SUBTYPE", paste0("PC", 1:7))]
+
+# Make sure response is factor
+train_pca_7$SUBTYPE <- as.factor(train_pca_7$SUBTYPE)
+test_pca_7$SUBTYPE  <- as.factor(test_pca_7$SUBTYPE)
+
+# Compute inverse-frequency class weights
+class_counts <- table(train_pca_7$SUBTYPE)
+class_weights <- 1 / class_counts
+
+obs_weights <- as.numeric(class_weights[as.character(train_pca_7$SUBTYPE)])
+
+# Fit weighted multinomial logistic regression
+multi_model <- multinom(SUBTYPE ~ ., 
+                        data = train_pca_7, 
+                        weights = obs_weights, 
+                        trace = FALSE)
+```
+now
+What this task is :
+
+1.fit a multinomial logistic regression model
+2.use SUBTYPE as the target
+3.use the first X PCs as predictors
+     -in our case, X = 7
+4.choose a reference level
+5.justify that choice
+6.print summary(model)
+
+---------------------------------------
+First: what is a reference level?
+
+Because we have 3 subtypes, multinomial logistic regression does not estimate all 3 directly in isolation.
+
+Instead, it picks one subtype as the baseline/reference, and compares the other two against it.
+
+So if reference = LGG_IDHmut-non-codel, the model estimates:
+
+LGG_IDHmut-codel vs LGG_IDHmut-non-codel
+LGG_IDHwt vs LGG_IDHmut-non-codel
+------------------------------------------
+Justification of Which subtype should be the reference?
+Best choice:  LGG_IDHmut-non-codel
+
+Why?
+
+Because it is the largest class in training data.
+
+it gives a more stable baseline
+comparisons are made against the most common subtype
+coefficient estimates are often more stable than using the smallest class
+
+
+```{r}
+#summary(model)
+library(nnet)
+
+# Keep only first 7 principal components + response
+train_pca_7 <- train_pca[, c("SUBTYPE", paste0("PC", 1:7))]
+test_pca_7  <- test_pca[,  c("SUBTYPE", paste0("PC", 1:7))]
+
+# Make SUBTYPE a factor
+train_pca_7$SUBTYPE <- as.factor(train_pca_7$SUBTYPE)
+test_pca_7$SUBTYPE  <- as.factor(test_pca_7$SUBTYPE)
+
+# Set the reference level to the largest class
+train_pca_7$SUBTYPE <- relevel(train_pca_7$SUBTYPE, ref = "LGG_IDHmut-non-codel")
+test_pca_7$SUBTYPE  <- relevel(test_pca_7$SUBTYPE, ref = "LGG_IDHmut-non-codel")
+
+# Compute inverse-frequency class weights
+class_counts <- table(train_pca_7$SUBTYPE)
+class_weights <- 1 / class_counts
+obs_weights <- as.numeric(class_weights[as.character(train_pca_7$SUBTYPE)])
+
+# Fit weighted multinomial logistic regression model
+multi_model <- multinom(SUBTYPE ~ ., 
+                        data = train_pca_7, 
+                        weights = obs_weights, 
+                        trace = FALSE)
+
+# Print model summary
+summary(multi_model)
+
+```
+-------
+output is basically telling
+how each PC affects the odds of being one subtype versus the reference subtype
+-------
+
+
+************** Part C  validating the classifier **********************
+
+ give this  model new data (test set) and check if its predictions are correct.
+ 
+ 
+```{r}
+#✅ Step 1: Predictions on test data
+predictions <- predict(multi_model, newdata = test_pca_7)
+#✅ Step 2: Confusion Matrix
+conf_matrix <- table(Predicted = predictions, Actual = test_pca_7$SUBTYPE)
+conf_matrix
+#✅ Step 3: Misclassification Rate
+misclassification_rate <- 1 - sum(diag(conf_matrix)) / sum(conf_matrix)
+misclassification_rate
+
+
+library(ggplot2)
+
+cm_df <- as.data.frame(conf_matrix)
+
+ggplot(cm_df, aes(x = Actual, y = Predicted, fill = Freq)) +
+  geom_tile() +
+  geom_text(aes(label = Freq), size = 5, fontface = "bold") +
+  scale_fill_gradient(low = "white", high = "steelblue") +
+  labs(
+    title = "Confusion Matrix",
+    x = "Actual Subtype",
+    y = "Predicted Subtype"
+  ) +
+  theme_minimal()
+```
+
+The confusion matrix was computed to evaluate the performance of the multinomial logistic regression model on the test data.
+
+Misclassification rate measures how often the model makes incorrect predictions.
+
+
+```{r}
+# Accuracy
+accuracy <- sum(diag(conf_matrix)) / sum(conf_matrix)
+
+# Misclassification rate
+misclassification_rate <- 1 - accuracy
+
+# Convert to percentage
+accuracy_percent <- round(accuracy * 100, 2)
+misclassification_percent <- round(misclassification_rate * 100, 2)
+
+# Print results
+cat("Accuracy:", accuracy_percent, "%\n")
+cat("Misclassification Rate:", misclassification_percent, "%\n")
+```
+
+
+```{r}
+# with 2 pcs
+library(nnet)
+
+# Keep only PC1 and PC2
+train_pca_2 <- train_pca[, c("SUBTYPE", "PC1", "PC2")]
+test_pca_2  <- test_pca[,  c("SUBTYPE", "PC1", "PC2")]
+
+# Convert to factor
+train_pca_2$SUBTYPE <- as.factor(train_pca_2$SUBTYPE)
+test_pca_2$SUBTYPE  <- as.factor(test_pca_2$SUBTYPE)
+
+# Set reference level (same as before)
+train_pca_2$SUBTYPE <- relevel(train_pca_2$SUBTYPE, ref = "LGG_IDHmut-non-codel")
+test_pca_2$SUBTYPE  <- relevel(test_pca_2$SUBTYPE, ref = "LGG_IDHmut-non-codel")
+
+# Fit model (you can keep weights OR skip — both acceptable)
+model_pc2 <- multinom(SUBTYPE ~ ., data = train_pca_2, trace = FALSE)
+
+# Predictions
+pred_pc2 <- predict(model_pc2, newdata = test_pca_2)
+
+# Confusion matrix
+cm_pc2 <- table(Predicted = pred_pc2, Actual = test_pca_2$SUBTYPE)
+
+# Misclassification rate
+mis_pc2 <- 1 - sum(diag(cm_pc2)) / sum(cm_pc2)
+
+# Convert to percentage
+mis_pc2_percent <- round(mis_pc2 * 100, 2)
+
+cat("Misclassification Rate (PC1 & PC2):", mis_pc2_percent, "%\n")
+```
+A multinomial logistic regression model was fitted using only the first two principal components as predictors. The misclassification rate on the test data increased compared to the model using seven principal components. This indicates that using only two principal components does not capture sufficient variation in the data to accurately distinguish between LGG subtypes, leading to reduced classification performance.
+
+👉 More PCs ≠ always better
+👉 Too few PCs = underfitting
+
+```{r}
+#lets try 100 pcs
+
+#Step 1: Use first 100 PCs
+train_pca_100 <- train_pca[, c("SUBTYPE", paste0("PC", 1:100))]
+test_pca_100  <- test_pca[,  c("SUBTYPE", paste0("PC", 1:100))]
+
+#Step 2: Factor + reference
+
+train_pca_100$SUBTYPE <- as.factor(train_pca_100$SUBTYPE)
+test_pca_100$SUBTYPE  <- as.factor(test_pca_100$SUBTYPE)
+
+train_pca_100$SUBTYPE <- relevel(train_pca_100$SUBTYPE, ref = "LGG_IDHmut-non-codel")
+test_pca_100$SUBTYPE  <- relevel(test_pca_100$SUBTYPE, ref = "LGG_IDHmut-non-codel")
+
+#Step 3: Fit model
+
+library(nnet)
+
+model_pc100 <- multinom(SUBTYPE ~ ., 
+                        data = train_pca_100, 
+                        trace = FALSE,
+                        MaxNWts = 10000)
+
+#Step 4: Predictions
+
+pred_pc100 <- predict(model_pc100, newdata = test_pca_100)
+
+#Step 5: Confusion matrix + error
+
+cm_pc100 <- table(Predicted = pred_pc100, Actual = test_pca_100$SUBTYPE)
+
+mis_pc100 <- 1 - sum(diag(cm_pc100)) / sum(cm_pc100)
+
+mis_pc100_percent <- round(mis_pc100 * 100, 2)
+
+cat("Misclassification Rate (PC1–PC100):", mis_pc100_percent, "%\n")
+```
+The misclassification rate did not significantly improve compared to the model using 7 principal components, indicating that additional components do not contribute meaningful predictive information and may introduce noise.
+
+```{r}
+#✅ Step 1: Create comparison table
+comparison_df <- data.frame(
+  Model = c("PC1–PC2", "PC1–PC7", "PC1–PC100"),
+  Misclassification = c(mis_pc2, misclassification_rate, mis_pc100)
+)
+
+# Convert to percentage
+comparison_df$Misclassification_Percent <- round(comparison_df$Misclassification * 100, 2)
+
+#✅ Step 2: Clean bar chart
+
+library(ggplot2)
+
+ggplot(comparison_df, aes(x = Model, y = Misclassification_Percent, fill = Model)) +
+  geom_col(width = 0.6) +
+  
+  geom_text(aes(label = paste0(Misclassification_Percent, "%")),
+            vjust = -0.4,
+            size = 5,
+            fontface = "bold") +
+  
+  labs(
+    title = "Comparison of Misclassification Rates",
+    subtitle = "Effect of Number of Principal Components",
+    x = "Model (Number of PCs Used)",
+    y = "Misclassification Rate (%)"
+  ) +
+  
+  scale_y_continuous(expand = expansion(mult = c(0, 0.15))) +
+  
+  theme_minimal() +
+  theme(legend.position = "none")
+
+```
+👉 The model using the first 7 principal components is the best, as it achieves the lowest misclassification rate and provides the most reliable predictions.
+
+--------------------------------------------------------
+
+What is baseline accuracy?
+
+From test data:
+
+LGG_IDHmut-non-codel = 56
+total = 102
+
+👉 Baseline accuracy ≈
+
+56 / 102 ≈ 55%
+
+So what is success?
+
+👉 model should beat ~55% accuracy
+
+Accuracy ≈ 96%
+
+👉 That is:
+
+far above baseline ✅
+very strong model ✅
+
+-------------------------------------------------
+
+analytical question
+
+How does the number of principal components (PCs) affect the performance of a multinomial logistic regression model in classifying LGG tumor subtypes compared to a baseline classifier?
+
+
